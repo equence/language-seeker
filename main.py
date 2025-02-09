@@ -4,14 +4,17 @@ import json
 import keyboard
 from PyQt5.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, 
                             QWidget, QLabel, QVBoxLayout)
-from PyQt5.QtCore import Qt, QTimer, QPoint
-from PyQt5.QtGui import QIcon, QFont, QColor, QPainter, QBrush
+from PyQt5.QtCore import Qt, QTimer, QPoint, QThread, pyqtSlot
+from PyQt5.QtGui import QIcon, QFont, QColor, QPainter, QBrush, QCursor
 from PIL import ImageGrab
 import pytesseract
 import pyautogui
 import hashlib
 from image_window import ImageWindow
 from region_selector import RegionSelector  # 新增导入
+from ocr_worker import OCRWorker
+import os
+import configparser
 
 # 配置信息（需要用户自己填写）
 BAIDU_APP_ID = '20250208002268787'
@@ -21,11 +24,14 @@ BAIDU_SECRET_KEY = '0L7Q4x4UUEz5XDO9x5lt'
 class TranslationWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.capture_region = (100, 100, 400, 300)  # 新增：初始化截取区域
+        self.thread = None  # 新增：初始化线程属性
+        self.config_path = os.path.join(os.path.dirname(__file__), "config.ini")
+        self.capture_region = self.load_config()  # 加载保存的区域或使用默认值
+        self.ocr_running = False  # 新增：防止重复OCR调用导致卡顿
         self.initUI()
         self.setupHotkeys()
         # 新增：注册手动区域截图的快捷键
-        keyboard.add_hotkey('ctrl+shift+s', self.manual_capture)
+        keyboard.add_hotkey('ctrl+shift+a', self.manual_capture)
         # 新增：创建图像显示窗口
         self.image_window = ImageWindow()
         self.image_window.show()
@@ -34,6 +40,40 @@ class TranslationWindow(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.check_messages)
         self.timer.start(2000)  # 2秒检查一次
+        self.threads = []  # 新增：保存启动的线程引用
+
+    def load_config(self):
+        config = configparser.ConfigParser()
+        if os.path.exists(self.config_path):
+            config.read(self.config_path)
+            try:
+                left = int(config.get("capture_region", "left"))
+                top = int(config.get("capture_region", "top"))
+                right = int(config.get("capture_region", "right"))
+                bottom = int(config.get("capture_region", "bottom"))
+                # 读取源语言设定，缺省为 English
+                source_lang = config.get("settings", "source_lang", fallback="en")
+                self.source_lang = source_lang
+                return (left, top, right, bottom)
+            except Exception:
+                pass
+        # 默认值
+        self.source_lang = "en"
+        return (100, 100, 400, 300)
+        
+    def save_config(self):
+        config = configparser.ConfigParser()
+        config["capture_region"] = {
+            "left": str(self.capture_region[0]),
+            "top": str(self.capture_region[1]),
+            "right": str(self.capture_region[2]),
+            "bottom": str(self.capture_region[3])
+        }
+        config["settings"] = {
+            "source_lang": self.source_lang
+        }
+        with open(self.config_path, "w") as configfile:
+            config.write(configfile)
 
     def initUI(self):
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
@@ -107,28 +147,46 @@ class TranslationWindow(QWidget):
         keyboard.add_hotkey('ctrl+shift+s', self.manual_capture)
 
     def translate_input(self):
-        # 需要实现获取输入框内容的功能（可能需要使用Windows API）
-        # 这里模拟翻译过程
-        chinese_text = "你好"  # 实际应该获取输入框内容
-        translated = self.translate_baidu(chinese_text, 'kor', 'zh')
+        # 修改：输入文本翻译方向为：中文 → 目标语言（由源语言选项决定）
+        chinese_text = "你好"  # 实际应获取输入内容
+        if self.source_lang == "en":
+            translated = self.translate_baidu(chinese_text, 'en', 'zh')
+        else:  # self.source_lang == "kor"
+            translated = self.translate_baidu(chinese_text, 'kor', 'zh')
         self.simulate_keyboard(translated)
 
     def check_messages(self):
-        # 直接捕获窗口覆盖区域，无需隐藏窗口
+        # 删除了调试输出
         self.capture_underlying()
     
+    def get_valid_bbox(self, bbox):
+        # 限制 bbox 在屏幕范围内
+        import pyautogui
+        sw, sh = pyautogui.size()
+        left, top, right, bottom = bbox
+        left = max(0, left)
+        top = max(0, top)
+        right = min(sw, right)
+        bottom = min(sh, bottom)
+        return (left, top, right, bottom)
+        
     def capture_underlying(self):
-        # 使用实例属性 self.capture_region 而非固定全局变量
-        left, top, right, bottom = self.capture_region
-        img = ImageGrab.grab(bbox=(left, top, right, bottom))
-        text = pytesseract.image_to_string(img, lang='eng')
-        if text.strip():
-            translation = self.translate_baidu(text, 'zh', 'en')
-            display_text = "识别内容：\n" + text.strip() + "\n\n翻译：\n" + translation
-        else:
-            display_text = ""
-        self.label.setText(display_text)
-        self.image_window.update_image(img)
+        from PyQt5.QtCore import QThread
+        thread = QThread()
+        self.threads.append(thread)  # 保存线程引用
+        worker = OCRWorker(self.capture_region, self.source_lang, self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        thread.worker = worker  # 保持对 worker 的引用，避免被垃圾回收
+        # 当线程完成后移除引用并自动删除线程
+        thread.finished.connect(lambda: self.threads.remove(thread))
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def handle_ocr_finished(self, translation, img):
+        self.label.setText(translation)
+        if img:
+            self.image_window.update_image(img)
 
     def manual_capture(self):
         # 使用单次定时器安排在主线程中启动区域选择器
@@ -139,13 +197,23 @@ class TranslationWindow(QWidget):
         self.selector.regionSelected.connect(self.handle_region_selected)
 
     def handle_region_selected(self, rect):
-        # 更新截取区域为用户选择的全局区域
+        if (rect.left() == rect.right() or rect.top() == rect.bottom()):
+            return
         self.capture_region = (rect.left(), rect.top(), rect.right(), rect.bottom())
-        img = ImageGrab.grab(bbox=self.capture_region)
-        text = pytesseract.image_to_string(img, lang='eng')
+        self.save_config()
+        left, top, right, bottom = self.capture_region
+        left, top, right, bottom = self.get_valid_bbox((left, top, right, bottom))
+        img = ImageGrab.grab(bbox=(left, top, right, bottom))
+        ocr_lang = "eng" if self.source_lang == "en" else "kor"
+        text = pytesseract.image_to_string(img, lang=ocr_lang)
         if text.strip():
-            translation = self.translate_baidu(text, 'zh', 'en')
-            display_text = "识别内容：\n" + text.strip() + "\n\n翻译：\n" + translation
+            lines = text.strip().splitlines()
+            translations = []
+            for line in lines:
+                if line.strip():
+                    tr = self.translate_baidu(line.strip(), 'zh', 'en') if self.source_lang == "en" else self.translate_baidu(line.strip(), 'zh', 'kor')
+                    translations.append(tr)
+            display_text = "\n".join(translations)
         else:
             display_text = ""
         self.label.setText(display_text)
@@ -188,8 +256,38 @@ if __name__ == '__main__':
     menu = QMenu()
     exit_action = menu.addAction("退出")
     exit_action.triggered.connect(app.quit)
-    tray.setContextMenu(menu)
     
+    # 创建源语言子菜单
+    lang_menu = QMenu("源语言")
+    english_action = lang_menu.addAction("英语")
+    korean_action = lang_menu.addAction("韩语")
+    english_action.setCheckable(True)
+    korean_action.setCheckable(True)
+    # 新增：根据加载的配置设置右键菜单当前选项
+    # window 已在下方创建之前加载ini配置
     window = TranslationWindow()
+    if window.source_lang == "en":
+        english_action.setChecked(True)
+        korean_action.setChecked(False)
+    else:
+        english_action.setChecked(False)
+        korean_action.setChecked(True)
+    
+    def set_language(lang):
+        window.source_lang = lang
+        english_action.setChecked(lang == "en")
+        korean_action.setChecked(lang == "kor")
+        window.save_config()  # 保存选择的语言
+        
+    english_action.triggered.connect(lambda: set_language("en"))
+    korean_action.triggered.connect(lambda: set_language("kor"))
+    
+    menu.addMenu(lang_menu)
+    menu.addAction(exit_action)
+    
+    # 使用 tray.setContextMenu() 后，不需额外连接 tray.activated 信号
+    tray.setContextMenu(menu)
+    # 移除 on_tray_activated 相关代码以降低卡顿
+    
     window.show()
     sys.exit(app.exec_())
