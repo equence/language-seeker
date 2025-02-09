@@ -13,8 +13,10 @@ import hashlib
 from image_window import ImageWindow
 from region_selector import RegionSelector  # 新增导入
 from ocr_worker import OCRWorker
+from about_window import AboutWindow  # 新增导入
 import os
 import configparser
+import pyautogui
 
 # 配置信息（需要用户自己填写）
 BAIDU_APP_ID = '20250208002268787'
@@ -28,6 +30,9 @@ class TranslationWindow(QWidget):
         self.config_path = os.path.join(os.path.dirname(__file__), "config.ini")
         self.capture_region = self.load_config()  # 加载保存的区域或使用默认值
         self.ocr_running = False  # 新增：防止重复OCR调用导致卡顿
+        self.is_always_on_top = True  # 新增：悬浮窗置顶标识
+        self.opacity_value = 1.0  # 新增：初始透明度
+        self.setWindowOpacity(self.opacity_value)  # 应用初始不透明度
         self.initUI()
         self.setupHotkeys()
         # 新增：注册手动区域截图的快捷键
@@ -161,7 +166,7 @@ class TranslationWindow(QWidget):
     
     def get_valid_bbox(self, bbox):
         # 限制 bbox 在屏幕范围内
-        import pyautogui
+
         sw, sh = pyautogui.size()
         left, top, right, bottom = bbox
         left = max(0, left)
@@ -171,7 +176,6 @@ class TranslationWindow(QWidget):
         return (left, top, right, bottom)
         
     def capture_underlying(self):
-        from PyQt5.QtCore import QThread
         thread = QThread()
         self.threads.append(thread)  # 保存线程引用
         worker = OCRWorker(self.capture_region, self.source_lang, self)
@@ -245,12 +249,36 @@ class TranslationWindow(QWidget):
         # 使用pyautogui模拟键盘输入
         pyautogui.write(text, interval=0.05)
 
+    def toggle_always_on_top(self):
+        self.is_always_on_top = not self.is_always_on_top
+        flags = self.windowFlags()
+        if self.is_always_on_top:
+            new_flags = flags | Qt.WindowStaysOnTopHint
+        else:
+            new_flags = flags & ~Qt.WindowStaysOnTopHint
+        self.setWindowFlags(new_flags)
+        self.show()
+
+    # 新增：调整不透明度方法，在1.0, 0.8, 0.6, 0.4之间循环
+    def adjust_opacity(self):
+        if self.opacity_value > 0.4:
+            self.opacity_value -= 0.2
+        else:
+            self.opacity_value = 1.0
+        self.setWindowOpacity(self.opacity_value)
+
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     
-    # 系统托盘图标
+    # 新增：根据 sys._MEIPASS 获取资源路径
+    if hasattr(sys, '_MEIPASS'):
+        icon_path = os.path.join(sys._MEIPASS, 'icon.png')
+    else:
+        icon_path = 'icon.png'
+        
+    # 系统托盘图标使用正确的资源路径
     tray = QSystemTrayIcon()
-    tray.setIcon(QIcon('icon.png'))
+    tray.setIcon(QIcon(icon_path))
     tray.setVisible(True)
     
     menu = QMenu()
@@ -266,6 +294,7 @@ if __name__ == '__main__':
     # 新增：根据加载的配置设置右键菜单当前选项
     # window 已在下方创建之前加载ini配置
     window = TranslationWindow()
+    about_window = AboutWindow()  # 新增：保持关于窗口引用
     if window.source_lang == "en":
         english_action.setChecked(True)
         korean_action.setChecked(False)
@@ -283,6 +312,17 @@ if __name__ == '__main__':
     korean_action.triggered.connect(lambda: set_language("kor"))
     
     menu.addMenu(lang_menu)
+    # 新增：悬浮窗置顶菜单项
+    always_on_top_action = menu.addAction("悬浮窗置顶")
+    always_on_top_action.setCheckable(True)
+    always_on_top_action.setChecked(True)
+    always_on_top_action.triggered.connect(lambda: window.toggle_always_on_top())
+    # 新增：调整不透明度菜单项
+    opacity_action = menu.addAction("调整不透明度")
+    opacity_action.triggered.connect(lambda: window.adjust_opacity())
+    # 修改：关于菜单项使用已存储的about_window引用
+    about_action = menu.addAction("关于")
+    about_action.triggered.connect(lambda: about_window.show())
     menu.addAction(exit_action)
     
     # 使用 tray.setContextMenu() 后，不需额外连接 tray.activated 信号
